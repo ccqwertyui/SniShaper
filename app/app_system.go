@@ -37,6 +37,13 @@ func (a *App) isManagedSystemProxy(status SystemProxyStatus) bool {
 	return false
 }
 
+// IsManagedSystemProxy reports whether the system proxy currently in effect is
+// the one this app configured, so callers can safely change it back.
+func (a *App) IsManagedSystemProxy() bool {
+	status := a.GetSystemProxyStatus()
+	return status.Enabled && a.isManagedSystemProxy(status)
+}
+
 func (a *App) saveManagedSystemProxyMarker(expected string) error {
 	marker := map[string]interface{}{
 		"expected_server": expected,
@@ -144,6 +151,11 @@ func (a *App) applySystemProxySync(enabled bool, port int, sync bool) error {
 func (a *App) EnableSystemProxy() error {
 	a.appendLog("[action] EnableSystemProxy called")
 
+	if a.GetTUNStatus().Running {
+		a.appendLog("[warn] EnableSystemProxy blocked: TUN is running")
+		return fmt.Errorf("TUN is running, disable TUN before enabling system proxy")
+	}
+
 	if !a.IsProxyRunning() {
 		a.appendLog("[action] Proxy not running, starting proxy before enabling system proxy...")
 		if err := a.StartProxy(); err != nil {
@@ -181,8 +193,17 @@ func (a *App) DisableSystemProxy() error {
 	return nil
 }
 
+// Platform seams for the regression tests: tests swap these package vars to
+// simulate system proxy state without mutating the proxy settings of the
+// machine the tests run on. Production code must call these, never the
+// sysproxy package directly.
+var (
+	sysproxyStatusFn  = sysproxy.GetSystemProxyStatus
+	sysproxyDisableFn = sysproxy.DisableSystemProxy
+)
+
 func (a *App) GetSystemProxyStatus() SystemProxyStatus {
-	status := sysproxy.GetSystemProxyStatus()
+	status := sysproxyStatusFn()
 	return SystemProxyStatus{
 		Enabled:  status.Enabled,
 		Server:   status.Server,
@@ -201,14 +222,7 @@ func (a *App) SetAutoStart(enabled bool) error {
 		a.appendLog(fmt.Sprintf("[error] SetAutoStart failed: %v", err))
 		return err
 	}
-	var command string
-	if enabled {
-		execPath, err := os.Executable()
-		if err == nil {
-			command = buildAutoStartCommand(execPath)
-		}
-	}
-	if err := setAutoStartEnabled(enabled, command); err != nil {
+	if err := a.syncAutoStartRegistration(); err != nil {
 		a.appendLog(fmt.Sprintf("[error] SetAutoStart register failed: %v", err))
 		return err
 	}
@@ -218,14 +232,32 @@ func (a *App) SetAutoStart(enabled bool) error {
 
 func (a *App) syncAutoStartRegistration() error {
 	if !a.GetAutoStart() {
-		return setAutoStartEnabled(false, "")
+		return setAutoStartEnabled(false, a.GetAutoStartMethod(), "")
 	}
 	execPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to resolve executable path")
 	}
-	command := buildAutoStartCommand(execPath)
-	return setAutoStartEnabled(true, command)
+	command := buildAutoStartCommand(execPath, a.GetShowMainWindowOnAutoStart(), a.GetAutoEnableProxyOnAutoStart())
+	return setAutoStartEnabled(true, a.GetAutoStartMethod(), command)
+}
+
+// GetAutoStartMethod returns the configured autostart mechanism: "task"
+// (Task Scheduler, default), "service" (Windows service host) or
+// "registry" (HKCU Run value).
+func (a *App) GetAutoStartMethod() string {
+	return a.ruleManager.GetAutoStartMethod()
+}
+
+// SetAutoStartMethod selects the autostart mechanism and re-registers the
+// entry under the new method, removing the previous one.
+func (a *App) SetAutoStartMethod(method string) error {
+	a.appendLog(fmt.Sprintf("[action] SetAutoStartMethod called: %s", method))
+	if err := a.ruleManager.SetAutoStartMethod(method); err != nil {
+		a.appendLog(fmt.Sprintf("[error] SetAutoStartMethod failed: %v", err))
+		return err
+	}
+	return a.syncAutoStartRegistration()
 }
 
 func (a *App) GetShowMainWindowOnAutoStart() bool {
@@ -234,7 +266,11 @@ func (a *App) GetShowMainWindowOnAutoStart() bool {
 
 func (a *App) SetShowMainWindowOnAutoStart(enabled bool) error {
 	a.appendLog(fmt.Sprintf("[action] SetShowMainWindowOnAutoStart called: %v", enabled))
-	return a.ruleManager.SetShowMainWindowOnAutoStart(enabled)
+	if err := a.ruleManager.SetShowMainWindowOnAutoStart(enabled); err != nil {
+		return err
+	}
+	// Keep the registry auto-start command in sync with this toggle
+	return a.syncAutoStartRegistration()
 }
 
 func (a *App) GetAutoEnableProxyOnAutoStart() bool {
@@ -243,11 +279,26 @@ func (a *App) GetAutoEnableProxyOnAutoStart() bool {
 
 func (a *App) SetAutoEnableProxyOnAutoStart(enabled bool) error {
 	a.appendLog(fmt.Sprintf("[action] SetAutoEnableProxyOnAutoStart called: %v", enabled))
-	return a.ruleManager.SetAutoEnableProxyOnAutoStart(enabled)
+	if err := a.ruleManager.SetAutoEnableProxyOnAutoStart(enabled); err != nil {
+		return err
+	}
+	// Keep the registry auto-start command in sync with this toggle
+	return a.syncAutoStartRegistration()
+}
+
+func (a *App) GetAutoEnableSysProxyOnAutoStart() bool {
+	return a.ruleManager.GetAutoEnableSysProxyOnAutoStart()
+}
+
+func (a *App) SetAutoEnableSysProxyOnAutoStart(enabled bool) error {
+	a.appendLog(fmt.Sprintf("[action] SetAutoEnableSysProxyOnAutoStart called: %v", enabled))
+	return a.ruleManager.SetAutoEnableSysProxyOnAutoStart(enabled)
 }
 
 // ForceCleanup is a last-resort synchronous cleanup for crash/force-exit paths.
-// It stops TUN, core, proxy, and system proxy without checking state.
+// It stops TUN, core, proxy, and the system proxy this app configured. A
+// system proxy the app does not own (user's own or third-party) is left in
+// place, matching shutdown(), StopProxy and startup recovery.
 func (a *App) ForceCleanup() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -263,16 +314,12 @@ func (a *App) ForceCleanup() {
 	if a.proxyServer != nil {
 		_ = a.proxyServer.Stop()
 	}
-	if err := sysproxy.DisableSystemProxy(); err != nil {
-		log.Printf("[ForceCleanup] sysproxy disable: %v", err)
+	if a.IsManagedSystemProxy() {
+		if err := sysproxyDisableFn(); err != nil {
+			log.Printf("[ForceCleanup] sysproxy disable: %v", err)
+		}
 	}
-}
-
-func (a *App) RevealMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindow.Show()
-		a.mainWindow.Focus()
-	}
+	a.closeLogFile()
 }
 
 func (a *App) GetCloseToTray() bool {
@@ -284,16 +331,21 @@ func (a *App) SetCloseToTray(enabled bool) error {
 	return a.ruleManager.SetCloseToTray(enabled)
 }
 
+func (a *App) GetHibernateOnClose() bool {
+	return a.ruleManager.GetHibernateOnClose()
+}
+
+func (a *App) SetHibernateOnClose(enabled bool) error {
+	a.appendLog(fmt.Sprintf("[action] SetHibernateOnClose: %v", enabled))
+	return a.ruleManager.SetHibernateOnClose(enabled)
+}
+
 func (a *App) WindowMinimise() {
-	if a.mainWindow != nil {
-		a.mainWindow.Minimise()
-	}
+	a.minimiseMainWindow()
 }
 
 func (a *App) WindowToggleMaximise() {
-	if a.mainWindow != nil {
-		a.mainWindow.ToggleMaximise()
-	}
+	a.toggleMaximiseMainWindow()
 }
 
 func (a *App) WindowClose() {
@@ -301,9 +353,15 @@ func (a *App) WindowClose() {
 }
 
 func (a *App) HandleWindowClose() {
-	if a.GetCloseToTray() && !a.shouldQuit && a.mainWindow != nil {
-		a.mainWindow.Hide()
-		return
+	if !a.shouldQuit && a.hasMainWindow() {
+		if a.GetHibernateOnClose() {
+			a.HibernateMainWindow()
+			return
+		}
+		if a.GetCloseToTray() {
+			a.hideMainWindow()
+			return
+		}
 	}
 	a.QuitApp()
 }
